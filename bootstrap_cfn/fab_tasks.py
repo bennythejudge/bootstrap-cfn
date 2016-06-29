@@ -417,20 +417,34 @@ def set_stack_name():
                 "in zone id '{}'...".format(stack_suffix, record, zone_id))
     # Let DNS update DNSServerError propogate
     r53_conn = get_connection(R53)
-    r53_conn.update_dns_record(zone_id, record, 'TXT', '"{0}"'.format(stack_suffix))
-    env.stack_name = "{0}-{1}".format(get_legacy_name(), stack_suffix)
+    try:
+        r53_conn.update_dns_record(zone_id, record, 'TXT', '"{0}"'.format(stack_suffix))
+        env.stack_name = "{0}-{1}".format(get_legacy_name(), stack_suffix)
+    except Exception as e:
+        logger.error("fab_tasks::set_stack_name:"
+                     "Error updating dns record: "
+                     "{}".format(e.message))
     return env.stack_name
+
 
 def hastag(stack_tag):
     """
     Check if stack_tag is in use
+    Args:
+        stack_tag: the tag of stack
+    Returns:
+        True if stack exists
 
     """
     r53_conn = get_connection(R53)
     zone_id = get_zone_id()
-    record =  "{}".format(get_tag_record_name(stack_tag))
-    hasrecord = r53_conn.get_record(get_zone_name(), zone_id, record, 'TXT')
+    record = "{}".format(get_tag_record_name(stack_tag))
+    try:
+        hasrecord = r53_conn.get_record(get_zone_name(), zone_id, record, 'TXT')
+    except:
+        raise StackRecordNotFoundError(record)
     return hasrecord
+
 
 def get_zone_name():
     zone_name = get_basic_config().get('master_zone', None)
@@ -438,6 +452,7 @@ def get_zone_name():
         raise CfnConfigError("No master_zone in yaml, unable to create/find DNS records for stack name")
     logger.info("fab_tasks::get_zone_id: Found master zone '{}' in config...".format(zone_name))
     return zone_name
+
 
 def get_zone_id():
     zone_name = get_zone_name()
@@ -449,13 +464,19 @@ def get_zone_id():
                 "for zone name '{}'...".format(zone_id, zone_name))
     return zone_id
 
+
 def get_legacy_name():
     legacy_name = "{0}-{1}".format(env.application, env.environment)
     return legacy_name
 
+
 def get_tag_record_name(stack_tag):
     """
     Returns record name in the format of: stack.[tag].[app]-[env]
+    Args:
+        stack_tag: the tag of stack
+    Returns:
+        record name like stack.[tag].[app]-[env]
     """
     legacy_name = get_legacy_name()
     record_name = "stack.{0}.{1}".format(stack_tag, legacy_name)
@@ -527,7 +548,6 @@ def cfn_delete(force=False, pre_delete_callbacks=None):
         for callback in pre_delete_callbacks:
             callback(stack_name=stack_name, config=cfn_config)
 
-    print green("\nSTACK {0} DELETING...\n").format(stack_name)
     r53_conn = get_connection(R53)
     if not force:
         x = raw_input("Are you really sure you want to blow away the whole stack for {}!? (y/n)\n".format(stack_name))
@@ -536,10 +556,11 @@ def cfn_delete(force=False, pre_delete_callbacks=None):
 
     elb = get_one_public_elbs()
     stack_id = stack_name.split('-')[-1]
-
-    if hasattr(env, 'tag') and not env.tag =='active':
+    if hasattr(env,"tag") and env.tag != 'active':
+        # delete inactive stack
         stack_tag = env.tag
-        logger.info("Deleting {} stack {}...".format(stack_tag, stack_name))
+        logger.info("Deleting {} inactive stack {}...".format(stack_tag, stack_name))
+        print green("\nSTACK {0} DELETING...\n").format(stack_name)
         # delete helloworld_12345.dsd.io [Alias record]
 
         stack_record_name = "{}-{}".format(elb, stack_id)
@@ -549,56 +570,45 @@ def cfn_delete(force=False, pre_delete_callbacks=None):
             raise e(stack_record_name)
         if stack_record_value:
             record_name = "{}.{}".format(stack_record_name, get_zone_name())
-            #stack_record_value = dns.resolver.query(stack_record_name, 'A')[0].to_text().replace('"', "")
             r53_conn.delete_dns_record(get_zone_id(), record_name, 'A', stack_record_value, is_alias=True)
         record_name = "{}.{}".format(get_tag_record_name(stack_tag), get_zone_name())
         try:
             record_value = dns.resolver.query(record_name, 'TXT')[0].to_text().replace('"', "")
         except dns.resolver.NXDOMAIN:
             raise DNSRecordNotFoundError(record_name)
+
         if record_value:
             r53_conn.delete_dns_record(get_zone_id(), record_name, 'TXT', '"{}"'.format(record_value))
 
-        #delete vpc dependencies before cfn
-        cfn.delete(stack_name)
         # Wait for stacks to delete
         print 'Waiting for stack to delete.'
+        cfn.delete(stack_name)
         tail(cfn, stack_name)
         if cfn.stack_missing(stack_name):
             print green("Stack successfully deleted")
         else:
-            print red("Stack deletion was unsuccessfull")
+            print red("Stack deletion was unsuccessful")
     else:
-        # delete dns records instead of stacks
+        # delete active dns records
+
         stack_tag = 'active'
-        # stack.active.helloworld-dev(.dsd.io)
-        tag_record_name = get_tag_record_name(stack_tag)
-        try:
-            record_value = r53_conn.get_record(get_zone_name(), get_zone_id(), tag_record_name, 'TXT')
-        except TagRecordNotFoundError as e:
-            raise e(tag_record_name)
+        print green("\nDELETING ACTIVE DNS RECORDS...\n")
 
-        record_name = '{}.{}'.format(tag_record_name, get_zone_name())
-        record = '"{}"'.format(record_value)
-
-        # delete [helloworld.dsd.io] record
+        # delete 'A' record
         main_record_name = "{}.{}".format(elb, get_zone_name())
         stack_record_name = "{}-{}".format(elb, stack_id)
-        try:
-            stack_record_value = r53_conn.get_record(get_zone_name(), get_zone_id(), stack_record_name, 'A')
-        except TagRecordNotFoundError as e:
-            raise e(stack_record_name)
-        try:
-            main_record_value = r53_conn.get_record(get_zone_name(), get_zone_id(), elb, 'A')
-        except TagRecordNotFoundError as e:
-            raise e(elb)
+        stack_record_value = r53_conn.get_record(get_zone_name(), get_zone_id(), stack_record_name, 'A')
+        main_record_value = r53_conn.get_record(get_zone_name(), get_zone_id(), elb, 'A')
         if stack_record_value and stack_record_value.to_print() == main_record_value.to_print():
             r53_conn.delete_dns_record(get_zone_id(), main_record_name, 'A', main_record_value, is_alias=True)
 
-        if stack_id and stack_id == record.replace('"',""):
-            # delete [stack.active.helloworld-dev.dsd.io] record
+        # delete 'TXT' record
+        tag_record_name = get_tag_record_name(stack_tag)
+        record_value = r53_conn.get_record(get_zone_name(), get_zone_id(), tag_record_name, 'TXT')
+        record_name = '{}.{}'.format(tag_record_name, get_zone_name())
+        record = '"{}"'.format(record_value)
+        if stack_id and stack_id == record.replace('"', ""):
             r53_conn.delete_dns_record(get_zone_id(), record_name, 'TXT', record)
-    # delete cfn stack at last because helloworld-12345.dsd.io Alias record value  is needed ^
 
     if not env.blocking:
         print 'Running in non blocking mode. Exiting.'
@@ -607,7 +617,6 @@ def cfn_delete(force=False, pre_delete_callbacks=None):
     if 'ssl' in cfn_config.data:
         iam = get_connection(IAM)
         iam.delete_ssl_certificate(cfn_config.ssl(), stack_name)
-
 
 @task
 def cfn_create(test=False):
@@ -793,35 +802,41 @@ def cycle_instances(delay=None):
         termination_delay = None
     asg.cycle_instances(termination_delay=termination_delay)
 
+
 @task
 def set_active_stack(tag, force=False):
     """
     Switch between stacks tagged differently
     Update 'active' stacks' DNS records to the one specified.
-
+    Args:
+        tag: the tag of stack to be active
+        force: if True, set it to active stack directly
     """
     # helloworld.active.dsd.io
     active_record = get_tag_record_name('active')
     r53_conn = get_connection(R53)
     zone_name = get_zone_name()
     zone_id = get_zone_id()
-    active_stack_id = r53_conn.get_record(zone_name, zone_id, active_record, 'TXT')
-    if has_active_stack() and not force:
-        x = raw_input("The current active stack is {}. Do you wanna change? (y/n)\n".format(active_stack_id))
+
+    tag_record = get_tag_record_name(tag)
+    tag_stack_id = r53_conn.get_record(zone_name, zone_id, tag_record, 'TXT')
+    if not tag_stack_id:
+        raise TagRecordNotFoundError(tag_record)
+
+    if get_active_stack() and not force:
+        active_stack_id = r53_conn.get_record(zone_name, zone_id, active_record, 'TXT')
+        x = raw_input("Your stack is {}. Do you wanna change? (y/n)\n".format(tag_stack_id))
         if x not in ['y', 'Y', 'Yes', 'yes']:
             sys.exit(1)
-    # helloworld.active.dsd.io
-    tag_record = get_tag_record_name(tag)
-    if not tag_record:
-        raise TagRecordNotFoundError(tag)
-    else:
-        tag_stack_id = r53_conn.get_record(zone_name, zone_id, tag_record, 'TXT')
 
     # update TXT record
-    # Point [helloworld.dsd.io]'s stack_id to [helloworld-tag.dsd.io]'s
-    r53_conn.update_dns_record(zone_id, "{}.{}".format(active_record, get_zone_name()),'TXT', '"{}"'.format(tag_stack_id))
-    logger.info("fab_tasks::set_active_stack: Successfully updated dns alias record")
-
+    try:
+        r53_conn.update_dns_record(zone_id, "{}.{}".format(active_record, get_zone_name()), 'TXT', '"{}"'.format(tag_stack_id))
+        logger.info("fab_tasks::set_active_stack: Successfully updated dns alias record")
+    except Exception as e:
+        logger.error("fab_tasks::set_stack_name:"
+                     "Error updating dns record: "
+                     "{}".format(e.message))
 
     # get all public facing elbs
     elb = get_one_public_elbs()
@@ -830,45 +845,69 @@ def set_active_stack(tag, force=False):
     # helloworld-12345.dsd.io
     stack_record_name = "{}-{}.{}".format(elb, tag_stack_id, zone_name)
     # get the ELB value in stack_record_name's record
-    record_value = r53_conn.get_record(zone_name, zone_id, "{}-{}".format(elb, tag_stack_id), 'A')
+    record_name = "{}-{}".format(elb, tag_stack_id)
+    record_value = r53_conn.get_record(zone_name, zone_id, record_name , 'A')
     if record_value:
         # point [helloworld.dsd.io] to [helloworld-12345.dsd.io]'s ELB
-        r53_conn.update_dns_record(zone_id, main_record_name,'A', record_value, is_alias=True)
-        logger.info("fab_tasks::set_active_stack: Successfully updated dns alias record")
-        logger.info("Active stack is changed to {}".format(tag_record))
+        try:
+            r53_conn.update_dns_record(zone_id, main_record_name,'A', record_value, is_alias=True)
+            logger.info("fab_tasks::set_active_stack: Successfully updated dns alias record")
+            print green("Active stack is switched to {}".format(tag_record))
+        except Exception as e:
+            logger.error("fab_tasks::set_stack_name:"
+                         "Error updating dns record: "
+                         "{}".format(e.message))
         return True
     else:
         raise StackRecordNotFoundError(stack_record_name)
 
-def has_active_stack():
-    active_record = get_tag_record_name('active')
-    r53_conn = get_connection(R53)
-    zone_name = get_zone_name()
-    zone_id = get_zone_id()
-    active_stack_id = r53_conn.get_record(zone_name, zone_id, active_record, 'TXT')
-    if not active_stack_id:
-        return False
-    elb = get_one_public_elbs()
-    dns_record_name = '{}-{}'.format(elb, active_stack_id)
-    dns_record_value = r53_conn.get_record(zone_name, zone_id, dns_record_name, 'A')
-    main_record_value = r53_conn.get_record(zone_name, zone_id, elb, 'A')
-    if dns_record_value == main_record_value:
-        return True
 
+@task
+def get_active_stack():
+    """
+    Returns stack id if active stack exists AND Alias record is set appropriately
+    """
+    try:
+        active_record = get_tag_record_name('active')
+        r53_conn = get_connection(R53)
+        zone_name = get_zone_name()
+        zone_id = get_zone_id()
+        active_stack_id = r53_conn.get_record(zone_name, zone_id, active_record, 'TXT')
+        elb = get_one_public_elbs()
+        dns_record_name = '{}-{}'.format(elb, active_stack_id)
+        dns_record_value = r53_conn.get_record(zone_name, zone_id, dns_record_name, 'A')
+        main_record_value = r53_conn.get_record(zone_name, zone_id, elb, 'A')
+    except:
+        print green("No active stack exists.")
+        return None
+    if active_stack_id and dns_record_value and dns_record_value.to_print() == main_record_value.to_print():
+        logger.info("fab_tasks::get_active_stack: "
+                    "Active stack id is: {}".format(active_stack_id))
+        print green("Active stack id is: {}".format(active_stack_id))
+        return active_stack_id
+    else:
+        print green("No active stack exists.")
+        return None
 def get_all_elbs():
+    """
+    Returns all available elbs from cloudformation configuration
+    """
     cfn_config = get_config()
-    elbs = [ x.get('name') for x in cfn_config.data.get('elb', {}) if x.get('scheme') == 'internet-facing']
+    elbs = [x.get('name') for x in cfn_config.data.get('elb', {}) if x.get('scheme') == 'internet-facing']
     return elbs
 
+
 def get_one_public_elbs():
-    # elbs: 0? 1? N?
+    """
+    Returns the first elb if exists.
+    """
     elbs = get_all_elbs()
     if len(elbs) < 1:
         raise PublicELBNotFoundError
     elif len(elbs) == 1:
         logger.info("fab_tasks::set_active_stack: Found one ELB '{}', "
-                        "using it for public ELB... ".format(elbs[0]))
+                    "using it for public ELB... ".format(elbs[0]))
     else:
         logger.info("fab_tasks::set_active_stack: Found multiple ELBs,"
-                       "using the first one '{}' as public ELB".format(elbs[0]))
+                    "using the first one '{}' as public ELB".format(elbs[0]))
     return elbs[0]
