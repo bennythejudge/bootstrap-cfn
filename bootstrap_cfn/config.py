@@ -257,12 +257,14 @@ class ConfigParser(object):
                 Application=Ref("AWS::StackId"),
                 Network="Public",
             ),
+            DependsOn=vpc.title,
         )
 
         gw_attachment = VPCGatewayAttachment(
             "AttachGateway",
             VpcId=Ref(vpc),
             InternetGatewayId=Ref(igw),
+            DependsOn=igw.title
         )
 
         route_table = RouteTable(
@@ -506,7 +508,6 @@ class ConfigParser(object):
             DBSubnetGroupDescription="VPC Subnets"
         )
         resources.append(rds_subnet_group)
-
         database_sg = SecurityGroup(
             "DatabaseSG",
             SecurityGroupIngress=[
@@ -525,6 +526,8 @@ class ConfigParser(object):
             ],
             VpcId=Ref("VPC"),
             GroupDescription="SG for EC2 Access to RDS",
+            # translates to DependsOn="AttachGateway",
+            DependsOn=[r.title for r in self._find_resources(template, "AWS::EC2::VPCGatewayAttachment")],
         )
         resources.append(database_sg)
 
@@ -1112,6 +1115,9 @@ class ConfigParser(object):
             LaunchConfigurationName=Ref(launch_config),
             HealthCheckGracePeriod=health_check_grace_period,
             HealthCheckType=health_check_type,
+            # should be equivalent to DependsOn= "AttachGateway",
+            DependsOn=[v.title for v in self.vpc() if 'AWS::EC2::VPCGatewayAttachment' == v.resource['Type']]
+
         )
         resources.append(scaling_group)
 
