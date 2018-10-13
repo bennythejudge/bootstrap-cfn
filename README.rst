@@ -450,3 +450,8 @@ http://docs.aws.amazon.com/ElasticLoadBalancing/latest/DeveloperGuide/elb-securi
 
 The policy currently in use by default is: ELBSecurityPolicy-2015-05.
 
+
+
+.. image:: https://badges.production.guardrails.io/bennythejudge/bootstrap-cfn.svg
+   :alt: GuardRails badge
+   :target: https://www.guardrails.io
